@@ -60,6 +60,20 @@ styles.css
 5. Obsidian을 재시작하거나 플러그인을 새로고침합니다.
 6. `설정 > 커뮤니티 플러그인`에서 `Visual Math InputM`을 활성화합니다.
 
+#### 방법 3. Codex 또는 Antigravity로 설치
+
+Codex나 Antigravity가 로컬 파일과 Obsidian vault에 접근할 수 있다면 아래처럼 요청할 수 있습니다.
+
+```text
+https://github.com/hyunsdaddy-moon/visual-math-inputm
+
+이 플러그인을 내 Obsidian vault에 설치하고 활성화해줘.
+```
+
+Codex/Antigravity는 GitHub 저장소에서 플러그인 파일을 받아 `.obsidian/plugins/visual-math-input/` 폴더에 설치하고, 필요하면 Obsidian에서 플러그인을 활성화합니다.
+
+이 방법은 로컬 파일 접근 권한이 있는 AI 작업 환경에서 사용하는 방법입니다. 일반 사용자는 BRAT 설치나 수동 설치 방법을 사용하면 됩니다.
+
 ### 사용 방법
 
 #### 수식 입력
@@ -236,6 +250,20 @@ styles.css
 4. Place the 3 files in that folder.
 5. Restart Obsidian or reload plugins.
 6. Enable `Visual Math InputM` in `Settings > Community plugins`.
+
+#### Option 3. Install with Codex or Antigravity
+
+If Codex or Antigravity can access your local files and Obsidian vault, you can ask it to install the plugin for you.
+
+```text
+https://github.com/hyunsdaddy-moon/visual-math-inputm
+
+Install this plugin in my Obsidian vault and enable it.
+```
+
+Codex/Antigravity can download the plugin files from GitHub, place them in `.obsidian/plugins/visual-math-input/`, and enable the plugin in Obsidian when possible.
+
+This method is for AI coding environments with local filesystem access. Regular users should use BRAT or manual installation.
 
 ### Usage
 
