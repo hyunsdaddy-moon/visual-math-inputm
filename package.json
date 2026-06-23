@@ -1,0 +1,38 @@
+{
+  "name": "obsidian-visual-math-input",
+  "version": "0.1.0",
+  "description": "Korean/HWP-style visual math input and exam paper helpers for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "mathlive",
+    "latex",
+    "math"
+  ],
+  "author": "hyunsdaddy-moon",
+  "license": "MIT",
+  "homepage": "https://github.com/hyunsdaddy-moon/visual-math-inputm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyunsdaddy-moon/visual-math-inputm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hyunsdaddy-moon/visual-math-inputm/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.3",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "^0.25.5",
+    "obsidian": "^1.8.7",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "mathlive": "^0.105.2"
+  }
+}
