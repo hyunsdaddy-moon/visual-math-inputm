@@ -1,6 +1,6 @@
 {
   "name": "obsidian-visual-math-input",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Korean/HWP-style visual math input and exam paper helpers for Obsidian.",
   "main": "main.js",
   "scripts": {

@@ -6,8 +6,13 @@ import {
   Modal,
   Notice,
   Plugin,
-  PluginSettingTab
+  PluginSettingTab,
+  Setting
 } from "obsidian";
+import { execFile } from "child_process";
+import { access, mkdtemp, readFile, rm } from "fs/promises";
+import { tmpdir, homedir } from "os";
+import path from "path";
 import { hangulEquationToLatex } from "./hangulEquation";
 import { HANGUL_EQUATION_EXAMPLES } from "./equationExamples";
 import "mathlive";
@@ -18,11 +23,15 @@ type MathSize = "small" | "normal" | "large" | "xlarge";
 interface VisualMathSettings {
   defaultMode: MathMode;
   insertSpacesInsideInlineMath: boolean;
+  codexCommand: string;
+  codexModel: string;
 }
 
 const DEFAULT_SETTINGS: VisualMathSettings = {
   defaultMode: "block",
-  insertSpacesInsideInlineMath: false
+  insertSpacesInsideInlineMath: false,
+  codexCommand: "codex",
+  codexModel: ""
 };
 
 const FIXED_MATH_MODE: MathMode = "block";
@@ -41,6 +50,13 @@ interface HangulEquationTarget {
   size?: MathSize;
   from?: EditorPosition;
   to?: EditorPosition;
+}
+
+interface ImageFormulaTarget {
+  imagePath: string;
+  mode: MathMode;
+  from: EditorPosition;
+  to: EditorPosition;
 }
 
 const SIZE_OPTIONS: Array<{ value: MathSize; label: string }> = [
@@ -160,6 +176,14 @@ export default class VisualMathInputPlugin extends Plugin {
       }
     });
 
+    this.addCommand({
+      id: "convert-image-to-math",
+      name: "수식이미지를 수식텍스트로 변환 / Convert formula image to math text",
+      editorCallback: async (editor) => {
+        await this.convertSelectedImageToMath(editor);
+      }
+    });
+
     this.addSettingTab(new VisualMathSettingTab(this.app, this));
   }
 
@@ -197,6 +221,41 @@ export default class VisualMathInputPlugin extends Plugin {
         editor.replaceSelection(formatted);
       }
     }).open();
+  }
+
+  private async convertSelectedImageToMath(editor: Editor): Promise<void> {
+    const imageTarget = getImageFormulaTarget(editor);
+
+    if (!imageTarget) {
+      new Notice("변환할 수식 이미지를 선택하거나 이미지 링크 위에 커서를 두세요.");
+      return;
+    }
+
+    let imageFilePath: string;
+    try {
+      imageFilePath = await resolveImageFilePath(this.app, imageTarget.imagePath);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : "이미지 파일을 찾을 수 없습니다.");
+      return;
+    }
+
+    const notice = new Notice("Codex CLI로 수식 이미지를 읽는 중입니다...", 0);
+
+    try {
+      const latex = await runCodexFormulaOcr(this.settings, imageFilePath);
+      notice.hide();
+
+      this.openHangulEquationModal(editor, {
+        source: latex,
+        mode: imageTarget.mode,
+        size: "normal",
+        from: imageTarget.from,
+        to: imageTarget.to
+      });
+    } catch (error) {
+      notice.hide();
+      new Notice(getCodexOcrErrorMessage(error), 12000);
+    }
   }
 }
 
@@ -294,6 +353,7 @@ class VisualMathModal extends Modal {
     if (!this.previewEl || !this.field) return;
 
     this.previewEl.setText(formatLatex(this.getLatexValue(), this.mode, {
+      ...DEFAULT_SETTINGS,
       defaultMode: this.mode,
       insertSpacesInsideInlineMath: false
     }));
@@ -438,6 +498,7 @@ class HangulEquationModal extends Modal {
     const latex = equationSourceToLatex(source);
     const sizedLatex = applyLatexSize(latex, this.size);
     const markdown = formatLatex(sizedLatex, this.insertMode, {
+      ...DEFAULT_SETTINGS,
       defaultMode: this.insertMode,
       insertSpacesInsideInlineMath: false
     });
@@ -469,6 +530,338 @@ function wrapSelectionInExamBox(editor: Editor): void {
   ].join("\n");
 
   editor.replaceSelection(boxed);
+}
+
+function getImageFormulaTarget(editor: Editor): ImageFormulaTarget | null {
+  const selection = editor.getSelection();
+
+  if (selection.trim()) {
+    const selectedImage = findFirstImageReference(selection);
+    if (!selectedImage) return null;
+
+    const selectionFrom = editor.getCursor("from");
+    const from = offsetToEditorPosition(selection, selectionFrom, selectedImage.index);
+    const to = offsetToEditorPosition(selection, selectionFrom, selectedImage.index + selectedImage.raw.length);
+
+    return {
+      imagePath: selectedImage.path,
+      mode: getModeForReplacement(editor, from, to),
+      from,
+      to
+    };
+  }
+
+  const cursor = editor.getCursor();
+  const line = editor.getLine(cursor.line);
+  const images = findImageReferences(line);
+  if (!images.length) return null;
+
+  const imageAtCursor =
+    images.find((image) => cursor.ch >= image.index && cursor.ch <= image.index + image.raw.length) ??
+    (images.length === 1 ? images[0] : null);
+
+  if (!imageAtCursor) return null;
+
+  const from = { line: cursor.line, ch: imageAtCursor.index };
+  const to = { line: cursor.line, ch: imageAtCursor.index + imageAtCursor.raw.length };
+
+  return {
+    imagePath: imageAtCursor.path,
+    mode: getModeForReplacement(editor, from, to),
+    from,
+    to
+  };
+}
+
+function findFirstImageReference(text: string): { raw: string; path: string; index: number } | null {
+  return findImageReferences(text)[0] ?? null;
+}
+
+function findImageReferences(text: string): Array<{ raw: string; path: string; index: number }> {
+  const references: Array<{ raw: string; path: string; index: number }> = [];
+  const wikiRegex = /!\[\[([^\]]+)\]\]/g;
+  const markdownRegex = /!\[[^\]]*]\(([^)]+)\)/g;
+
+  for (const match of text.matchAll(wikiRegex)) {
+    references.push({
+      raw: match[0],
+      path: cleanImageReferencePath(match[1]),
+      index: match.index ?? 0
+    });
+  }
+
+  for (const match of text.matchAll(markdownRegex)) {
+    references.push({
+      raw: match[0],
+      path: cleanImageReferencePath(match[1]),
+      index: match.index ?? 0
+    });
+  }
+
+  return references.sort((a, b) => a.index - b.index);
+}
+
+function cleanImageReferencePath(rawPath: string): string {
+  let cleaned = rawPath.trim();
+
+  if (cleaned.startsWith("<") && cleaned.endsWith(">")) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  const pipeIndex = cleaned.indexOf("|");
+  if (pipeIndex !== -1) {
+    cleaned = cleaned.slice(0, pipeIndex).trim();
+  }
+
+  return decodeURI(cleaned);
+}
+
+function offsetToEditorPosition(text: string, start: EditorPosition, offset: number): EditorPosition {
+  const prefix = text.slice(0, offset);
+  const lines = prefix.split(/\n/);
+
+  if (lines.length === 1) {
+    return { line: start.line, ch: start.ch + lines[0].length };
+  }
+
+  return {
+    line: start.line + lines.length - 1,
+    ch: lines[lines.length - 1].length
+  };
+}
+
+function getModeForReplacement(editor: Editor, from: EditorPosition, to: EditorPosition): MathMode {
+  if (from.line !== to.line) return "block";
+
+  const line = editor.getLine(from.line);
+  const remaining = `${line.slice(0, from.ch)}${line.slice(to.ch)}`;
+  return remaining.trim() ? "inline" : "block";
+}
+
+async function resolveImageFilePath(app: App, imagePath: string): Promise<string> {
+  if (/^https?:\/\//i.test(imagePath)) {
+    throw new Error("인터넷 이미지 주소는 아직 지원하지 않습니다. vault 안의 이미지 파일을 사용하세요.");
+  }
+
+  if (imagePath.startsWith("file://")) {
+    const filePath = decodeURI(new URL(imagePath).pathname);
+    await assertFileExists(filePath);
+    return filePath;
+  }
+
+  if (path.isAbsolute(imagePath)) {
+    await assertFileExists(imagePath);
+    return imagePath;
+  }
+
+  const activeFile = app.workspace.getActiveFile();
+  const foundFile = app.metadataCache.getFirstLinkpathDest(imagePath, activeFile?.path ?? "");
+
+  if (!foundFile) {
+    throw new Error(`이미지 파일을 찾을 수 없습니다: ${imagePath}`);
+  }
+
+  const adapter = app.vault.adapter as {
+    getFullPath?: (normalizedPath: string) => string;
+    getBasePath?: () => string;
+  };
+
+  const fullPath =
+    typeof adapter.getFullPath === "function"
+      ? adapter.getFullPath(foundFile.path)
+      : typeof adapter.getBasePath === "function"
+        ? path.join(adapter.getBasePath(), foundFile.path)
+        : "";
+
+  if (!fullPath) {
+    throw new Error("이 Obsidian 환경에서는 로컬 이미지 경로를 확인할 수 없습니다.");
+  }
+
+  await assertFileExists(fullPath);
+  return fullPath;
+}
+
+async function assertFileExists(filePath: string): Promise<void> {
+  try {
+    await access(filePath);
+  } catch {
+    throw new Error(`이미지 파일을 찾을 수 없습니다: ${filePath}`);
+  }
+}
+
+async function runCodexFormulaOcr(settings: VisualMathSettings, imageFilePath: string): Promise<string> {
+  const outputDir = await mkdtemp(path.join(tmpdir(), "visual-math-inputm-"));
+  const outputPath = path.join(outputDir, "formula.txt");
+  const command = await resolveCodexCommand(settings.codexCommand);
+  const args = buildCodexOcrArgs(settings, imageFilePath, outputPath);
+
+  try {
+    await execFileAsync(command, args, {
+      env: {
+        ...process.env,
+        PATH: getCodexPath()
+      },
+      timeout: 180000,
+      maxBuffer: 1024 * 1024 * 4
+    });
+
+    const rawLatex = await readFile(outputPath, "utf8");
+    const latex = cleanupCodexLatex(rawLatex);
+    if (!latex) {
+      throw new Error("Codex가 수식을 읽지 못했습니다. 이미지를 더 선명하게 잘라서 다시 시도하세요.");
+    }
+
+    return latex;
+  } finally {
+    await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+function buildCodexOcrArgs(settings: VisualMathSettings, imageFilePath: string, outputPath: string): string[] {
+  const args = [
+    "exec",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only",
+    "--image",
+    imageFilePath,
+    "--output-last-message",
+    outputPath
+  ];
+
+  if (settings.codexModel.trim()) {
+    args.push("--model", settings.codexModel.trim());
+  }
+
+  args.push(
+    [
+      "Read the attached image and transcribe the math expression as LaTeX.",
+      "Return only the LaTeX body.",
+      "Do not include dollar signs, Markdown code fences, explanations, labels, or surrounding text.",
+      "Do not run shell commands or modify files.",
+      "If the image contains several math lines, use aligned, cases, matrix, or line breaks as appropriate."
+    ].join(" ")
+  );
+
+  return args;
+}
+
+async function resolveCodexCommand(settingValue: string): Promise<string> {
+  const configured = settingValue.trim() || "codex";
+  const candidates = configured === "codex"
+    ? [
+        "codex",
+        path.join(homedir(), ".local/bin/codex"),
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex"
+      ]
+    : [configured];
+
+  for (const candidate of candidates) {
+    if (candidate.includes(path.sep)) {
+      try {
+        await access(candidate);
+        return candidate;
+      } catch {
+        continue;
+      }
+    }
+
+    return candidate;
+  }
+
+  throw new Error("Codex CLI를 찾을 수 없습니다. 설정에서 codex 실행 파일 경로를 지정하세요.");
+}
+
+function getCodexPath(): string {
+  const existingPath = process.env.PATH ?? "";
+  const additions = [
+    path.join(homedir(), ".local/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin"
+  ];
+
+  return [...additions, existingPath].filter(Boolean).join(":");
+}
+
+function execFileAsync(
+  command: string,
+  args: string[],
+  options: {
+    env: NodeJS.ProcessEnv;
+    timeout: number;
+    maxBuffer: number;
+  }
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        const message = [error.message, stderr, stdout].filter(Boolean).join("\n");
+        reject(new Error(message));
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+function cleanupCodexLatex(rawLatex: string): string {
+  let cleaned = rawLatex
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .replace(/^```(?:latex|tex|math)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim()
+    .replace(/^LaTeX\s*:\s*/i, "")
+    .trim();
+
+  cleaned = unwrapMathDelimiters(cleaned);
+  return cleaned.trim();
+}
+
+function unwrapMathDelimiters(latex: string): string {
+  const trimmed = latex.trim();
+
+  if (trimmed.startsWith("$$") && trimmed.endsWith("$$")) {
+    return trimmed.slice(2, -2);
+  }
+
+  if (trimmed.startsWith("\\[") && trimmed.endsWith("\\]")) {
+    return trimmed.slice(2, -2);
+  }
+
+  if (trimmed.startsWith("\\(") && trimmed.endsWith("\\)")) {
+    return trimmed.slice(2, -2);
+  }
+
+  if (trimmed.startsWith("$") && trimmed.endsWith("$")) {
+    return trimmed.slice(1, -1);
+  }
+
+  return trimmed;
+}
+
+function getCodexOcrErrorMessage(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+
+  if (/ENOENT|not found|찾을 수 없습니다/i.test(detail)) {
+    return "Codex CLI를 실행하지 못했습니다. Visual Math InputM 설정에서 codex 실행 파일 경로를 확인하세요.";
+  }
+
+  if (/login|auth|authentication|unauthorized/i.test(detail)) {
+    return "Codex CLI 로그인이 필요합니다. 터미널에서 `codex login`을 먼저 실행하세요.";
+  }
+
+  if (/timed out|timeout/i.test(detail)) {
+    return "Codex OCR 시간이 초과되었습니다. 이미지를 수식 부분만 작게 잘라서 다시 시도하세요.";
+  }
+
+  return `수식 이미지 변환에 실패했습니다: ${detail.slice(0, 240)}`;
 }
 
 function equationSourceToLatex(source: string): string {
@@ -515,6 +908,32 @@ class VisualMathSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       text: "시험지 레이아웃은 새 노트에서 'Visual Math InputM: 시험지 템플릿 삽입'을 실행한 뒤 읽기/인쇄 화면에서 확인합니다."
     });
+
+    new Setting(containerEl)
+      .setName("Codex CLI 경로")
+      .setDesc("수식 이미지 변환에 사용할 codex 실행 파일입니다. 기본값은 codex입니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("codex 또는 /Users/.../.local/bin/codex")
+          .setValue(this.plugin.settings.codexCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.codexCommand = value.trim() || "codex";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Codex 모델")
+      .setDesc("비워 두면 Codex CLI 기본 모델을 사용합니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("예: gpt-5")
+          .setValue(this.plugin.settings.codexModel)
+          .onChange(async (value) => {
+            this.plugin.settings.codexModel = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
   }
 }
 

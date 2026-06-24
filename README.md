@@ -23,6 +23,7 @@ Visual Math InputM은 Obsidian에서 수학 수식을 더 쉽게 입력하기 �
 - 수학 예제 107개 제공
 - 시험지 템플릿 삽입
 - 선택 영역을 `<보기>` 박스로 감싸고 가운데 정렬
+- 선택한 수식 이미지를 Codex CLI로 읽어 수식 텍스트로 변환
 - Obsidian Live Preview의 수식 블록 폭을 수식 크기에 맞게 표시
 
 ### 설치 방법
@@ -169,6 +170,30 @@ cssclasses:
 
 `exam-center` 표시는 화면에 보이지 않고, 박스 안 내용을 가운데 정렬하기 위해 사용됩니다.
 
+#### 수식 이미지 변환
+
+스캔한 수식 이미지나 캡처 이미지를 Markdown에 넣은 뒤, 이미지 링크를 선택하거나 커서를 이미지 링크 위에 둡니다.
+
+```markdown
+![[Pasted image 20260624123000.png]]
+```
+
+그다음 `Command + P`를 누르고 `Visual Math InputM: 수식이미지를 수식텍스트로 변환 / Convert formula image to math text`를 실행합니다.
+
+플러그인은 로컬 Codex CLI를 실행해서 이미지를 읽고 LaTeX로 변환한 뒤, 한글 수식 입력 팝업을 엽니다. 결과를 확인하고 필요한 부분을 고친 다음 `넣기`를 누르면 이미지 링크가 수식 텍스트로 바뀝니다.
+
+이 기능은 Obsidian 데스크톱에서만 동작합니다. 터미널에서 먼저 Codex CLI 로그인이 되어 있어야 합니다.
+
+```bash
+codex login
+```
+
+macOS에서 Obsidian이 `codex` 명령을 찾지 못하면 `설정 > Visual Math InputM > Codex CLI 경로`에 실제 경로를 넣습니다.
+
+```text
+/Users/hyunsdaddy/.local/bin/codex
+```
+
 ### 지원 입력 예시
 
 ```text
@@ -214,6 +239,7 @@ It also includes helpers for creating math exam papers: exam templates, view box
 - 107 built-in math examples
 - Insert a math exam template
 - Wrap selected content in a centered `<View>` box
+- Convert a selected formula image into LaTeX text with Codex CLI
 - Fit rendered math block width to the formula size in Live Preview
 
 ### Installation
@@ -359,6 +385,30 @@ Result:
 ```
 
 The `exam-center` marker is hidden visually and only controls centering.
+
+#### Convert a formula image
+
+Insert a scanned or captured formula image into a Markdown note, then select the image link or place the cursor on it.
+
+```markdown
+![[Pasted image 20260624123000.png]]
+```
+
+Press `Command + P` and run `Visual Math InputM: 수식이미지를 수식텍스트로 변환 / Convert formula image to math text`.
+
+The plugin runs the local Codex CLI, asks it to read the image as LaTeX, then opens the Visual Math InputM popup so you can verify and edit the result before replacing the image link with formula text.
+
+This feature only works in Obsidian Desktop. Codex CLI must already be logged in:
+
+```bash
+codex login
+```
+
+If Obsidian cannot find the `codex` command on macOS, set the exact executable path in `Settings > Visual Math InputM > Codex CLI path`.
+
+```text
+/Users/hyunsdaddy/.local/bin/codex
+```
 
 ### Supported input examples
 
