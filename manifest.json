@@ -1,7 +1,7 @@
 {
   "id": "visual-math-input",
   "name": "Visual Math InputM",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "1.5.0",
   "description": "Korean/HWP-style visual math input and exam paper helpers for Obsidian.",
   "author": "hyunsdaddy-moon",
