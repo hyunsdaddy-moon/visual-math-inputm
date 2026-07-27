@@ -1,4 +1,5 @@
 import {
+  addIcon,
   App,
   Editor,
   EditorPosition,
@@ -72,6 +73,22 @@ const SIZE_COMMANDS: Record<MathSize, string> = {
   large: "\\Large",
   xlarge: "\\Huge"
 };
+
+const VISUAL_MATH_ICON_ID = "visual-math-input-operators";
+const VISUAL_MATH_ICON_SVG = `
+<g fill="none" stroke="#6d28ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="10.5">
+  <path d="M32 9V41" />
+  <path d="M16 25H48" />
+  <path d="M61 25H89" />
+  <path d="M19 58L45 84" />
+  <path d="M45 58L19 84" />
+  <path d="M61 72H89" />
+</g>
+<g fill="#6d28ff">
+  <circle cx="75" cy="57" r="5.3" />
+  <circle cx="75" cy="88" r="5.3" />
+</g>
+`;
 
 const EXAM_TEMPLATE = `---
 cssclasses:
@@ -147,9 +164,12 @@ export default class VisualMathInputPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    this.addRibbonIcon("sigma", "Visual Math InputM", () => {
+    addIcon(VISUAL_MATH_ICON_ID, VISUAL_MATH_ICON_SVG);
+
+    const ribbonIcon = this.addRibbonIcon(VISUAL_MATH_ICON_ID, "Visual Math InputM", () => {
       this.openHangulEquationModalForActiveEditor();
     });
+    ribbonIcon.addClass("visual-math-input-ribbon-icon");
 
     this.addCommand({
       id: "open",

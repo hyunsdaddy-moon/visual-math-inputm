@@ -1,3 +1,8 @@
+.visual-math-input-ribbon-icon .svg-icon {
+  width: 28.8px;
+  height: 28.8px;
+}
+
 .modal.visual-math-input-shell {
   width: min(640px, calc(100vw - 48px));
   max-width: calc(100vw - 48px);
