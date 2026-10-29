@@ -10,30 +10,89 @@ import {
   PluginSettingTab,
   Setting
 } from "obsidian";
-import { execFile } from "child_process";
-import { access, mkdtemp, readFile, rm } from "fs/promises";
-import { tmpdir, homedir } from "os";
-import path from "path";
 import { hangulEquationToLatex } from "./hangulEquation";
 import { HANGUL_EQUATION_EXAMPLES } from "./equationExamples";
 import "mathlive";
 
+// 아이패드·아이폰의 Obsidian에는 Node 런타임이 없습니다.
+// 수식 OCR만 Node를 쓰므로, 모듈을 최상단에서 import 하지 않고 필요할 때만 가져옵니다.
+type NodeChildProcessModule = typeof import("child_process");
+type NodeFsPromisesModule = typeof import("fs/promises");
+type NodeOsModule = typeof import("os");
+type NodePathModule = typeof import("path");
+
+const DESKTOP_ONLY_OCR_MESSAGE =
+  "수식 이미지 OCR은 데스크톱 Obsidian에서만 됩니다. 아이패드·아이폰에서는 수식 입력과 시험지 기능을 사용하세요.";
+
+const nodeModuleCache = new Map<string, unknown>();
+
+function getNodeRequire(): ((id: string) => unknown) | null {
+  const requireFn = (window as Window & { require?: (id: string) => unknown }).require;
+  return typeof requireFn === "function" ? requireFn : null;
+}
+
+function isNodeRuntimeAvailable(): boolean {
+  return getNodeRequire() !== null;
+}
+
+function requireNodeModule<T>(moduleName: string): T {
+  const cached = nodeModuleCache.get(moduleName);
+  if (cached) {
+    return cached as T;
+  }
+
+  const requireFn = getNodeRequire();
+  if (!requireFn) {
+    throw new Error(DESKTOP_ONLY_OCR_MESSAGE);
+  }
+
+  const loaded = requireFn(moduleName) as T;
+  nodeModuleCache.set(moduleName, loaded);
+  return loaded;
+}
+
+const nodeChildProcess = (): NodeChildProcessModule => requireNodeModule<NodeChildProcessModule>("child_process");
+const nodeFs = (): NodeFsPromisesModule => requireNodeModule<NodeFsPromisesModule>("fs/promises");
+const nodeOs = (): NodeOsModule => requireNodeModule<NodeOsModule>("os");
+const nodePath = (): NodePathModule => requireNodeModule<NodePathModule>("path");
+
 type MathMode = "inline" | "block" | "text";
 type MathSize = "small" | "normal" | "large" | "xlarge";
+type OcrEngine = "codex" | "claude" | "gemini";
 
 interface VisualMathSettings {
   defaultMode: MathMode;
   insertSpacesInsideInlineMath: boolean;
+  ocrEngine: OcrEngine;
   codexCommand: string;
   codexModel: string;
+  claudeCommand: string;
+  claudeModel: string;
+  geminiCommand: string;
+  geminiModel: string;
 }
 
 const DEFAULT_SETTINGS: VisualMathSettings = {
   defaultMode: "block",
   insertSpacesInsideInlineMath: false,
+  ocrEngine: "codex",
   codexCommand: "codex",
-  codexModel: ""
+  codexModel: "",
+  claudeCommand: "claude",
+  claudeModel: "",
+  geminiCommand: "gemini",
+  geminiModel: ""
 };
+
+const OCR_ENGINE_OPTIONS: Array<{ value: OcrEngine; label: string }> = [
+  { value: "codex", label: "Codex CLI" },
+  { value: "claude", label: "Claude Code" },
+  { value: "gemini", label: "Gemini CLI" }
+];
+
+function getOcrEngineLabel(engine: OcrEngine): string {
+  return OCR_ENGINE_OPTIONS.find((option) => option.value === engine)?.label ?? engine;
+}
 
 const FIXED_MATH_MODE: MathMode = "block";
 
@@ -231,19 +290,48 @@ export default class VisualMathInputPlugin extends Plugin {
   }
 
   private openHangulEquationModal(editor: Editor, target: HangulEquationTarget): void {
-    new HangulEquationModal(this.app, target, (source, size) => {
-      const latex = equationSourceToLatex(source);
-      const formatted = formatLatex(applyLatexSize(latex, size), target.mode, this.settings);
+    new HangulEquationModal(
+      this.app,
+      target,
+      (source, size) => {
+        const latex = equationSourceToLatex(source);
+        const formatted = formatLatex(applyLatexSize(latex, size), target.mode, this.settings);
 
-      if (target.from && target.to) {
-        editor.replaceRange(formatted, target.from, target.to);
-      } else {
-        editor.replaceSelection(formatted);
+        if (target.from && target.to) {
+          editor.replaceRange(formatted, target.from, target.to);
+        } else {
+          editor.replaceSelection(formatted);
+        }
+      },
+      (blob, name, engine) => this.convertImageBlobToLatex(blob, name, engine),
+      this.settings.ocrEngine,
+      (engine) => {
+        this.settings.ocrEngine = engine;
+        void this.saveSettings();
       }
-    }).open();
+    ).open();
+  }
+
+  private async convertImageBlobToLatex(blob: Blob, name: string, engine: OcrEngine): Promise<string> {
+    if (!isNodeRuntimeAvailable()) {
+      throw new Error(DESKTOP_ONLY_OCR_MESSAGE);
+    }
+
+    const temp = await writeBlobToTempImage(blob, name);
+
+    try {
+      return await runFormulaOcr(this.settings, engine, temp.path);
+    } finally {
+      await nodeFs().rm(temp.dir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   private async convertSelectedImageToMath(editor: Editor): Promise<void> {
+    if (!isNodeRuntimeAvailable()) {
+      new Notice(DESKTOP_ONLY_OCR_MESSAGE);
+      return;
+    }
+
     const imageTarget = getImageFormulaTarget(editor);
 
     if (!imageTarget) {
@@ -259,10 +347,11 @@ export default class VisualMathInputPlugin extends Plugin {
       return;
     }
 
-    const notice = new Notice("Codex CLI로 수식 이미지를 읽는 중입니다...", 0);
+    const engine = this.settings.ocrEngine;
+    const notice = new Notice(`${getOcrEngineLabel(engine)}로 수식 이미지를 읽는 중입니다...`, 0);
 
     try {
-      const latex = await runCodexFormulaOcr(this.settings, imageFilePath);
+      const latex = await runFormulaOcr(this.settings, engine, imageFilePath);
       notice.hide();
 
       this.openHangulEquationModal(editor, {
@@ -274,7 +363,7 @@ export default class VisualMathInputPlugin extends Plugin {
       });
     } catch (error) {
       notice.hide();
-      new Notice(getCodexOcrErrorMessage(error), 12000);
+      new Notice(getOcrErrorMessage(error, engine), 12000);
     }
   }
 }
@@ -384,6 +473,8 @@ class VisualMathModal extends Modal {
   }
 }
 
+type ImageStatusKind = "info" | "loading" | "success" | "error";
+
 class HangulEquationModal extends Modal {
   private sourceEl?: HTMLTextAreaElement;
   private previewField?: MathfieldElement;
@@ -392,14 +483,28 @@ class HangulEquationModal extends Modal {
   private readonly insertMode: MathMode;
   private size: MathSize;
 
+  private imagePreviewEl?: HTMLImageElement;
+  private imageStatusEl?: HTMLElement;
+  private convertImageButton?: HTMLButtonElement;
+  private clearImageButton?: HTMLButtonElement;
+  private engineSelectEl?: HTMLSelectElement;
+  private pendingImage?: { blob: Blob; name: string };
+  private objectUrl?: string;
+  private isConverting = false;
+  private engine: OcrEngine;
+
   constructor(
     app: App,
     private readonly target: HangulEquationTarget,
-    private readonly onSubmit: (source: string, size: MathSize) => void
+    private readonly onSubmit: (source: string, size: MathSize) => void,
+    private readonly onConvertImage?: (blob: Blob, name: string, engine: OcrEngine) => Promise<string>,
+    defaultEngine: OcrEngine = "codex",
+    private readonly onEngineChange?: (engine: OcrEngine) => void
   ) {
     super(app);
     this.insertMode = target.mode;
     this.size = target.size ?? "normal";
+    this.engine = defaultEngine;
   }
 
   onOpen(): void {
@@ -427,6 +532,11 @@ class HangulEquationModal extends Modal {
         this.submit();
       }
     });
+
+    if (this.onConvertImage) {
+      this.createImagePanel(contentEl);
+      contentEl.addEventListener("paste", this.handlePaste);
+    }
 
     const exampleLibrary = contentEl.createDiv({ cls: "visual-math-example-library" });
     const exampleSelect = exampleLibrary.createEl("select", {
@@ -478,12 +588,189 @@ class HangulEquationModal extends Modal {
   }
 
   onClose(): void {
+    this.contentEl.removeEventListener("paste", this.handlePaste);
+    this.revokeObjectUrl();
     this.contentEl.empty();
   }
 
   private submit(): void {
     this.onSubmit(this.sourceEl?.value ?? "", this.size);
     this.close();
+  }
+
+  private createImagePanel(containerEl: HTMLElement): void {
+    const panel = containerEl.createDiv({ cls: "visual-math-image-panel" });
+
+    panel.createDiv({
+      cls: "visual-math-image-hint",
+      text: "수식 이미지를 복사해 붙여넣기(Ctrl/⌘+V) 하거나 '이미지 선택'으로 파일을 불러온 뒤, 변환 엔진을 고르고 '이미지 → 수식 변환'을 누르세요."
+    });
+
+    const engineControl = panel.createDiv({ cls: "visual-math-image-engine" });
+    engineControl.createEl("span", { text: "변환 엔진" });
+    this.engineSelectEl = engineControl.createEl("select", {
+      attr: { "aria-label": "이미지 변환 엔진" }
+    });
+    for (const option of OCR_ENGINE_OPTIONS) {
+      this.engineSelectEl.createEl("option", { text: option.label, value: option.value });
+    }
+    this.engineSelectEl.value = this.engine;
+    this.engineSelectEl.addEventListener("change", () => {
+      this.engine = this.engineSelectEl?.value as OcrEngine;
+      this.onEngineChange?.(this.engine);
+    });
+
+    const controls = panel.createDiv({ cls: "visual-math-image-controls" });
+
+    const fileInput = panel.createEl("input", {
+      cls: "visual-math-image-file",
+      attr: { type: "file", accept: "image/*" }
+    });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (file) this.setPendingImage(file, file.name || "uploaded-image.png");
+      fileInput.value = "";
+    });
+
+    const uploadButton = controls.createEl("button", {
+      text: "이미지 선택",
+      attr: { type: "button" }
+    });
+    uploadButton.addEventListener("click", () => fileInput.click());
+
+    this.convertImageButton = controls.createEl("button", {
+      text: "이미지 → 수식 변환",
+      cls: "mod-cta",
+      attr: { type: "button" }
+    });
+    this.convertImageButton.disabled = true;
+    this.convertImageButton.addEventListener("click", () => {
+      void this.convertPendingImage();
+    });
+
+    this.clearImageButton = controls.createEl("button", {
+      text: "이미지 지우기",
+      attr: { type: "button" }
+    });
+    this.clearImageButton.disabled = true;
+    this.clearImageButton.addEventListener("click", () => this.clearPendingImage());
+
+    const previewWrap = panel.createDiv({ cls: "visual-math-image-preview-wrap" });
+    this.imagePreviewEl = previewWrap.createEl("img", { cls: "visual-math-image-preview-img" });
+    this.imagePreviewEl.hide();
+
+    this.imageStatusEl = panel.createDiv({ cls: "visual-math-image-status" });
+  }
+
+  private handlePaste = (event: ClipboardEvent): void => {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+
+    for (const item of Array.from(items)) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          event.preventDefault();
+          this.setPendingImage(file, file.name || "clipboard-image.png");
+          return;
+        }
+      }
+    }
+  };
+
+  private setPendingImage(blob: Blob, name: string): void {
+    this.revokeObjectUrl();
+    this.pendingImage = { blob, name };
+    this.objectUrl = URL.createObjectURL(blob);
+
+    if (this.imagePreviewEl) {
+      this.imagePreviewEl.src = this.objectUrl;
+      this.imagePreviewEl.show();
+    }
+
+    if (this.convertImageButton) this.convertImageButton.disabled = false;
+    if (this.clearImageButton) this.clearImageButton.disabled = false;
+
+    this.setImageStatus("이미지가 준비되었습니다. '이미지 → 수식 변환'을 누르세요.", "info");
+  }
+
+  private clearPendingImage(): void {
+    if (this.isConverting) return;
+
+    this.revokeObjectUrl();
+    this.pendingImage = undefined;
+
+    if (this.imagePreviewEl) {
+      this.imagePreviewEl.removeAttribute("src");
+      this.imagePreviewEl.hide();
+    }
+
+    if (this.convertImageButton) this.convertImageButton.disabled = true;
+    if (this.clearImageButton) this.clearImageButton.disabled = true;
+
+    this.setImageStatus("", "info");
+  }
+
+  private async convertPendingImage(): Promise<void> {
+    if (!this.pendingImage || this.isConverting || !this.onConvertImage) return;
+
+    this.isConverting = true;
+    this.setConvertingState(true);
+    this.setImageStatus(`${getOcrEngineLabel(this.engine)}로 수식 이미지를 읽는 중입니다...`, "loading");
+
+    try {
+      const latex = await this.onConvertImage(this.pendingImage.blob, this.pendingImage.name, this.engine);
+
+      if (!latex.trim()) {
+        this.setImageStatus("수식을 인식하지 못했습니다. 이미지를 더 선명하게 잘라서 다시 시도하세요.", "error");
+        return;
+      }
+
+      this.applyRecognizedLatex(latex);
+      this.setImageStatus("수식을 인식했습니다. 아래 입력창에서 확인하고 필요하면 수정하세요.", "success");
+    } catch (error) {
+      this.setImageStatus(getOcrErrorMessage(error, this.engine), "error");
+    } finally {
+      this.isConverting = false;
+      this.setConvertingState(false);
+    }
+  }
+
+  private applyRecognizedLatex(latex: string): void {
+    if (!this.sourceEl) return;
+
+    this.sourceEl.value = latex;
+    this.updatePreview();
+    this.sourceEl.focus();
+  }
+
+  private setConvertingState(converting: boolean): void {
+    if (this.convertImageButton) {
+      this.convertImageButton.disabled = converting || !this.pendingImage;
+      this.convertImageButton.setText(converting ? "변환 중..." : "이미지 → 수식 변환");
+    }
+    if (this.clearImageButton) {
+      this.clearImageButton.disabled = converting || !this.pendingImage;
+    }
+    if (this.engineSelectEl) {
+      this.engineSelectEl.disabled = converting;
+    }
+  }
+
+  private setImageStatus(text: string, kind: ImageStatusKind): void {
+    if (!this.imageStatusEl) return;
+
+    this.imageStatusEl.setText(text);
+    this.imageStatusEl.toggleClass("is-loading", kind === "loading");
+    this.imageStatusEl.toggleClass("is-success", kind === "success");
+    this.imageStatusEl.toggleClass("is-error", kind === "error");
+  }
+
+  private revokeObjectUrl(): void {
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = undefined;
+    }
   }
 
   private createSizeControl(containerEl: HTMLElement): void {
@@ -669,7 +956,7 @@ async function resolveImageFilePath(app: App, imagePath: string): Promise<string
     return filePath;
   }
 
-  if (path.isAbsolute(imagePath)) {
+  if (nodePath().isAbsolute(imagePath)) {
     await assertFileExists(imagePath);
     return imagePath;
   }
@@ -690,7 +977,7 @@ async function resolveImageFilePath(app: App, imagePath: string): Promise<string
     typeof adapter.getFullPath === "function"
       ? adapter.getFullPath(foundFile.path)
       : typeof adapter.getBasePath === "function"
-        ? path.join(adapter.getBasePath(), foundFile.path)
+        ? nodePath().join(adapter.getBasePath(), foundFile.path)
         : "";
 
   if (!fullPath) {
@@ -703,37 +990,169 @@ async function resolveImageFilePath(app: App, imagePath: string): Promise<string
 
 async function assertFileExists(filePath: string): Promise<void> {
   try {
-    await access(filePath);
+    await nodeFs().access(filePath);
   } catch {
     throw new Error(`이미지 파일을 찾을 수 없습니다: ${filePath}`);
   }
 }
 
+async function writeBlobToTempImage(blob: Blob, name: string): Promise<{ path: string; dir: string }> {
+  const dir = await nodeFs().mkdtemp(nodePath().join(nodeOs().tmpdir(), "visual-math-inputm-paste-"));
+  const ext = pickImageExtension(blob.type, name);
+  const filePath = nodePath().join(dir, `formula${ext}`);
+  const buffer = Buffer.from(await blob.arrayBuffer());
+  await nodeFs().writeFile(filePath, buffer);
+  return { path: filePath, dir };
+}
+
+function pickImageExtension(mimeType: string, name: string): string {
+  const fromName = nodePath().extname(name || "").toLowerCase();
+  if (/^\.(png|jpg|jpeg|gif|webp|bmp)$/.test(fromName)) return fromName;
+
+  if (/png/i.test(mimeType)) return ".png";
+  if (/jpe?g/i.test(mimeType)) return ".jpg";
+  if (/gif/i.test(mimeType)) return ".gif";
+  if (/webp/i.test(mimeType)) return ".webp";
+  if (/bmp/i.test(mimeType)) return ".bmp";
+  return ".png";
+}
+
+function runFormulaOcr(
+  settings: VisualMathSettings,
+  engine: OcrEngine,
+  imageFilePath: string
+): Promise<string> {
+  switch (engine) {
+    case "claude":
+      return runClaudeFormulaOcr(settings, imageFilePath);
+    case "gemini":
+      return runGeminiFormulaOcr(settings, imageFilePath);
+    default:
+      return runCodexFormulaOcr(settings, imageFilePath);
+  }
+}
+
+function buildFormulaOcrPrompt(fileNameHint?: string): string {
+  return [
+    fileNameHint
+      ? `Read the image file "${fileNameHint}" in the current directory and transcribe the math expression as LaTeX.`
+      : "Read the attached image and transcribe the math expression as LaTeX.",
+    "Return only the LaTeX body.",
+    "Do not include dollar signs, Markdown code fences, explanations, labels, or surrounding text.",
+    "Do not run shell commands or modify files.",
+    "If the image contains several math lines, use aligned, cases, matrix, or line breaks as appropriate."
+  ].join(" ");
+}
+
+function logOcr(message: string, data?: Record<string, unknown>): void {
+  if (data) {
+    console.info(`[Visual Math InputM] ${message}`, data);
+  } else {
+    console.info(`[Visual Math InputM] ${message}`);
+  }
+}
+
+function tailText(text: string, max = 400): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return collapsed.length > max ? `…${collapsed.slice(-max)}` : collapsed;
+}
+
+function describeFailedOcr(engineLabel: string, stdout: string, stderr: string): string {
+  const detail = tailText(stderr || stdout);
+  const base = `${engineLabel}가 수식을 읽지 못했습니다. 이미지를 더 선명하게 잘라서 다시 시도하세요.`;
+  return detail ? `${base} (CLI 메시지: ${detail})` : base;
+}
+
+async function runClaudeFormulaOcr(settings: VisualMathSettings, imageFilePath: string): Promise<string> {
+  const command = await resolveCliCommand(settings.claudeCommand, "claude");
+  const fileName = nodePath().basename(imageFilePath);
+  // 임시 폴더의 이미지 한 장을 읽기만 하므로 권한 프롬프트를 건너뜁니다.
+  // (--allowedTools Read 로는 헤드리스 쿼리가 빈 결과를 반환하는 문제가 있음)
+  const args = ["-p", "--dangerously-skip-permissions"];
+
+  if (settings.claudeModel.trim()) {
+    args.push("--model", settings.claudeModel.trim());
+  }
+
+  args.push(buildFormulaOcrPrompt(fileName));
+  logOcr("Claude OCR 시작", { command, cwd: nodePath().dirname(imageFilePath), imageFilePath });
+
+  const { stdout, stderr } = await execFileCaptureAsync(command, args, {
+    cwd: nodePath().dirname(imageFilePath),
+    env: { ...process.env, PATH: getCliPath() },
+    timeout: 300000,
+    maxBuffer: 1024 * 1024 * 4
+  });
+
+  const latex = cleanupCodexLatex(stdout);
+  logOcr("Claude OCR 완료", { stdoutLength: stdout.length, stderrTail: tailText(stderr, 200), latex });
+  if (!latex) {
+    throw new Error(describeFailedOcr("Claude Code", stdout, stderr));
+  }
+
+  return latex;
+}
+
+async function runGeminiFormulaOcr(settings: VisualMathSettings, imageFilePath: string): Promise<string> {
+  const command = await resolveCliCommand(settings.geminiCommand, "gemini");
+  const fileName = nodePath().basename(imageFilePath);
+  const args = ["-y", "-p", `@${fileName} ${buildFormulaOcrPrompt(fileName)}`];
+
+  if (settings.geminiModel.trim()) {
+    args.push("--model", settings.geminiModel.trim());
+  }
+
+  logOcr("Gemini OCR 시작", { command, cwd: nodePath().dirname(imageFilePath), imageFilePath });
+
+  const { stdout, stderr } = await execFileCaptureAsync(command, args, {
+    cwd: nodePath().dirname(imageFilePath),
+    env: { ...process.env, PATH: getCliPath() },
+    timeout: 300000,
+    maxBuffer: 1024 * 1024 * 4
+  });
+
+  const latex = cleanupCodexLatex(stdout);
+  logOcr("Gemini OCR 완료", { stdoutLength: stdout.length, stderrTail: tailText(stderr, 200), latex });
+  if (!latex) {
+    throw new Error(describeFailedOcr("Gemini CLI", stdout, stderr));
+  }
+
+  return latex;
+}
+
 async function runCodexFormulaOcr(settings: VisualMathSettings, imageFilePath: string): Promise<string> {
-  const outputDir = await mkdtemp(path.join(tmpdir(), "visual-math-inputm-"));
-  const outputPath = path.join(outputDir, "formula.txt");
-  const command = await resolveCodexCommand(settings.codexCommand);
+  const outputDir = await nodeFs().mkdtemp(nodePath().join(nodeOs().tmpdir(), "visual-math-inputm-"));
+  const outputPath = nodePath().join(outputDir, "formula.txt");
+  const command = await resolveCliCommand(settings.codexCommand, "codex");
   const args = buildCodexOcrArgs(settings, imageFilePath, outputPath);
 
+  logOcr("Codex OCR 시작", { command, imageFilePath, outputPath });
+
   try {
-    await execFileAsync(command, args, {
+    const { stdout, stderr } = await execFileCaptureAsync(command, args, {
       env: {
         ...process.env,
-        PATH: getCodexPath()
+        PATH: getCliPath()
       },
-      timeout: 180000,
+      timeout: 300000,
       maxBuffer: 1024 * 1024 * 4
     });
 
-    const rawLatex = await readFile(outputPath, "utf8");
-    const latex = cleanupCodexLatex(rawLatex);
+    const rawLatex = await nodeFs().readFile(outputPath, "utf8").catch(() => "");
+    const latex = cleanupCodexLatex(rawLatex || stdout);
+    logOcr("Codex OCR 완료", {
+      outputFileLength: rawLatex.length,
+      stdoutLength: stdout.length,
+      stderrTail: tailText(stderr, 200),
+      latex
+    });
     if (!latex) {
-      throw new Error("Codex가 수식을 읽지 못했습니다. 이미지를 더 선명하게 잘라서 다시 시도하세요.");
+      throw new Error(describeFailedOcr("Codex CLI", stdout, stderr));
     }
 
     return latex;
   } finally {
-    await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+    await nodeFs().rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -755,52 +1174,50 @@ function buildCodexOcrArgs(settings: VisualMathSettings, imageFilePath: string, 
     args.push("--model", settings.codexModel.trim());
   }
 
-  args.push(
-    [
-      "Read the attached image and transcribe the math expression as LaTeX.",
-      "Return only the LaTeX body.",
-      "Do not include dollar signs, Markdown code fences, explanations, labels, or surrounding text.",
-      "Do not run shell commands or modify files.",
-      "If the image contains several math lines, use aligned, cases, matrix, or line breaks as appropriate."
-    ].join(" ")
-  );
+  args.push(buildFormulaOcrPrompt());
 
   return args;
 }
 
-async function resolveCodexCommand(settingValue: string): Promise<string> {
-  const configured = settingValue.trim() || "codex";
-  const candidates = configured === "codex"
-    ? [
-        "codex",
-        path.join(homedir(), ".local/bin/codex"),
-        "/opt/homebrew/bin/codex",
-        "/usr/local/bin/codex"
-      ]
-    : [configured];
+async function resolveCliCommand(settingValue: string, defaultName: string): Promise<string> {
+  const configured = settingValue.trim() || defaultName;
 
-  for (const candidate of candidates) {
-    if (candidate.includes(path.sep)) {
-      try {
-        await access(candidate);
-        return candidate;
-      } catch {
-        continue;
-      }
-    }
-
-    return candidate;
+  // 사용자가 절대 경로를 직접 지정한 경우 그대로 사용합니다.
+  if (configured !== defaultName) {
+    return configured;
   }
 
-  throw new Error("Codex CLI를 찾을 수 없습니다. 설정에서 codex 실행 파일 경로를 지정하세요.");
+  // GUI 앱(Obsidian)은 최소 PATH로 실행되므로, 알려진 설치 경로를 먼저 확인해
+  // 존재하면 절대 경로로 실행합니다(PATH 해석에 의존하지 않음).
+  const absoluteCandidates = [
+    nodePath().join(nodeOs().homedir(), ".local/bin", defaultName),
+    `/opt/homebrew/bin/${defaultName}`,
+    `/usr/local/bin/${defaultName}`,
+    nodePath().join(nodeOs().homedir(), ".npm-global/bin", defaultName),
+    nodePath().join(nodeOs().homedir(), ".bun/bin", defaultName)
+  ];
+
+  for (const candidate of absoluteCandidates) {
+    try {
+      await nodeFs().access(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+
+  // 그래도 못 찾으면 보정한 PATH에 기대어 이름으로 실행합니다.
+  return defaultName;
 }
 
-function getCodexPath(): string {
+function getCliPath(): string {
   const existingPath = process.env.PATH ?? "";
   const additions = [
-    path.join(homedir(), ".local/bin"),
+    nodePath().join(nodeOs().homedir(), ".local/bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
+    nodePath().join(nodeOs().homedir(), ".npm-global/bin"),
+    nodePath().join(nodeOs().homedir(), ".bun/bin"),
     "/usr/bin",
     "/bin"
   ];
@@ -808,25 +1225,30 @@ function getCodexPath(): string {
   return [...additions, existingPath].filter(Boolean).join(":");
 }
 
-function execFileAsync(
+function execFileCaptureAsync(
   command: string,
   args: string[],
   options: {
+    cwd?: string;
     env: NodeJS.ProcessEnv;
     timeout: number;
     maxBuffer: number;
   }
-): Promise<void> {
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, options, (error, stdout, stderr) => {
+    const child = nodeChildProcess().execFile(command, args, options, (error, stdout, stderr) => {
       if (error) {
         const message = [error.message, stderr, stdout].filter(Boolean).join("\n");
         reject(new Error(message));
         return;
       }
 
-      resolve();
+      resolve({ stdout, stderr });
     });
+
+    // Codex 등 일부 CLI는 stdin에서 추가 입력을 기다리므로, 즉시 EOF를 보내
+    // "Reading additional input from stdin..." 상태로 멈추지 않게 합니다.
+    child.stdin?.end();
   });
 }
 
@@ -866,19 +1288,30 @@ function unwrapMathDelimiters(latex: string): string {
   return trimmed;
 }
 
-function getCodexOcrErrorMessage(error: unknown): string {
-  const detail = error instanceof Error ? error.message : String(error);
+const OCR_LOGIN_HINT: Record<OcrEngine, string> = {
+  codex: "터미널에서 `codex login`을 먼저 실행하세요.",
+  claude: "터미널에서 `claude`로 한 번 로그인해 두세요.",
+  gemini: "터미널에서 `gemini`로 한 번 로그인해 두세요."
+};
 
-  if (/ENOENT|not found|찾을 수 없습니다/i.test(detail)) {
-    return "Codex CLI를 실행하지 못했습니다. Visual Math InputM 설정에서 codex 실행 파일 경로를 확인하세요.";
+function getOcrErrorMessage(error: unknown, engine: OcrEngine): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  const label = getOcrEngineLabel(engine);
+
+  if (/ineligible|no longer supported|Code Assist|antigravity/i.test(detail)) {
+    return "Gemini CLI 무료 등급이 중단되어 이미지 인식을 사용할 수 없습니다. 변환 엔진을 Codex CLI로 바꿔서 사용하세요.";
   }
 
-  if (/login|auth|authentication|unauthorized/i.test(detail)) {
-    return "Codex CLI 로그인이 필요합니다. 터미널에서 `codex login`을 먼저 실행하세요.";
+  if (/ENOENT|not found|찾을 수 없습니다/i.test(detail)) {
+    return `${label}를 실행하지 못했습니다. Visual Math InputM 설정에서 ${engine} 실행 파일 경로를 확인하세요.`;
+  }
+
+  if (/login|auth|authentication|unauthorized|credential/i.test(detail)) {
+    return `${label} 로그인이 필요합니다. ${OCR_LOGIN_HINT[engine]}`;
   }
 
   if (/timed out|timeout/i.test(detail)) {
-    return "Codex OCR 시간이 초과되었습니다. 이미지를 수식 부분만 작게 잘라서 다시 시도하세요.";
+    return `${label} 변환 시간이 초과되었습니다. 이미지를 수식 부분만 작게 잘라서 다시 시도하세요.`;
   }
 
   return `수식 이미지 변환에 실패했습니다: ${detail.slice(0, 240)}`;
@@ -930,6 +1363,21 @@ class VisualMathSettingTab extends PluginSettingTab {
     });
 
     new Setting(containerEl)
+      .setName("이미지 변환 엔진")
+      .setDesc("수식 이미지를 텍스트로 변환할 때 기본으로 사용할 CLI입니다. 변환 창에서 그때그때 바꿀 수도 있습니다.")
+      .addDropdown((dropdown) => {
+        for (const option of OCR_ENGINE_OPTIONS) {
+          dropdown.addOption(option.value, option.label);
+        }
+        dropdown.setValue(this.plugin.settings.ocrEngine).onChange(async (value) => {
+          this.plugin.settings.ocrEngine = value as OcrEngine;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Codex CLI" });
+
+    new Setting(containerEl)
       .setName("Codex CLI 경로")
       .setDesc("수식 이미지 변환에 사용할 codex 실행 파일입니다. 기본값은 codex입니다.")
       .addText((text) => {
@@ -951,6 +1399,62 @@ class VisualMathSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.codexModel)
           .onChange(async (value) => {
             this.plugin.settings.codexModel = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
+
+    containerEl.createEl("h3", { text: "Claude Code" });
+
+    new Setting(containerEl)
+      .setName("Claude Code 경로")
+      .setDesc("수식 이미지 변환에 사용할 claude 실행 파일입니다. 기본값은 claude입니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("claude 또는 /Users/.../.local/bin/claude")
+          .setValue(this.plugin.settings.claudeCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.claudeCommand = value.trim() || "claude";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Claude 모델")
+      .setDesc("비워 두면 Claude Code 기본 모델을 사용합니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("예: sonnet")
+          .setValue(this.plugin.settings.claudeModel)
+          .onChange(async (value) => {
+            this.plugin.settings.claudeModel = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
+
+    containerEl.createEl("h3", { text: "Gemini CLI" });
+
+    new Setting(containerEl)
+      .setName("Gemini CLI 경로")
+      .setDesc("수식 이미지 변환에 사용할 gemini 실행 파일입니다. 기본값은 gemini입니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("gemini 또는 /usr/local/bin/gemini")
+          .setValue(this.plugin.settings.geminiCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.geminiCommand = value.trim() || "gemini";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Gemini 모델")
+      .setDesc("비워 두면 Gemini CLI 기본 모델을 사용합니다.")
+      .addText((text) => {
+        text
+          .setPlaceholder("예: gemini-2.5-pro")
+          .setValue(this.plugin.settings.geminiModel)
+          .onChange(async (value) => {
+            this.plugin.settings.geminiModel = value.trim();
             await this.plugin.saveSettings();
           });
       });

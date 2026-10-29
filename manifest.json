@@ -5,5 +5,5 @@
   "minAppVersion": "1.5.0",
   "description": "Korean/HWP-style visual math input and exam paper helpers for Obsidian.",
   "author": "hyunsdaddy-moon",
-  "isDesktopOnly": true
+  "isDesktopOnly": false
 }
